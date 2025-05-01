@@ -1,0 +1,137 @@
+---
+title: "RRF"
+output: html_document
+date: "2025-03-13"
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(corrplot)
+library(factoextra)
+library(matrixStats)
+library(ggbiplot)
+library(ggpubr)
+library(cowplot)
+library(umap)
+library(M3C)
+library(caret)
+library(randomForest)
+library(RRF)
+library(ggpubr)
+``` 
+
+combine features for RRF analysis
+
+```{r}
+CN_summary <- read.csv("tables/PureCN_summary.csv", row.names = 1) %>%
+  dplyr::select(sample, subtype, purity, ploidy, PGA_dominant, PGA_diploid)
+CN_cluster_log2R <- read.csv("tables/CNV_clusters_avg_log2R.csv")
+filtered_mutation <- read.csv("tables/filtered_mutations.csv")
+TMB <- read.table("../data/TSO_results/TMB.txt")
+names(TMB) <- c("sample", "TMB")
+
+combined.feature <- CN_summary %>%
+  left_join(TMB, by = c("sample")) %>%
+  left_join(CN_cluster_log2R, by = "sample") %>%
+  left_join(filtered_mutation, by = c("sample" = "Tumor_Sample_Barcode"))
+
+write.csv(combined.feature, "tables/RRF_combined_features.csv", row.names = F)
+```  
+
+run RRF 100 times, 
+
+```{r}
+control <- trainControl(method = "LGOCV", number = 100, search = "grid", p = 0.7, savePredictions = "final", summaryFunction = twoClassSummary, classProbs = T)
+RRF_list <- list()
+featureImp <- data.frame(feature = c(), importance = c(), run = c())
+
+for (i in c(2:100)) {
+  RRF_list[[i]] <- train(subtype~., 
+                         data = combined.feature[, -c(1)], 
+                         method = "RRF", 
+                         metric = "ROC", 
+                         trControl = control)
+  featureImp.i <- varImp(RRF_list[[i]])$importance %>%
+    dplyr::filter(Overall !=0 ) %>%
+    arrange(-Overall)
+  featureImp.i <- featureImp.i %>%
+    dplyr::rename(importance = Overall) %>%
+    mutate(feature = rownames(featureImp.i),
+           run = i) %>%
+    dplyr::select(feature, importance, run)
+  featureImp <- rbind(featureImp, featureImp.i)
+  
+  # saveRDS(RRF_list, "Rdata/RRF_list.RDS")
+  # saveRDS(featureImp, "Rdata/featureImp.RDS")
+}
+
+```
+
+plot feature occurance and importance
+
+```{r, fig.width=7, fig.height=5}
+featureImp <- readRDS("Rdata/featureImp.RDS")
+feature.summary <- featureImp %>%
+  group_by(feature) %>%
+  summarise(count = n(), avg.importance = mean(importance)) %>%
+  arrange(-count) %>%
+  top_n(n=10, wt = count)
+
+feature.summary$feature <- factor(feature.summary$feature, levels = unique(feature.summary$feature))
+
+pdf("figures/revision/RRF_feature_selection.pdf", width = 7, height = 5)
+ggplot(feature.summary, aes(x=feature, y=count, fill = avg.importance)) +
+  geom_bar(stat = "identity") +
+  xlab("") + ylab("frequency (%)") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  scale_fill_continuous(low = "#56B1F7", high = "#132B43")
+dev.off()
+```
+
+RF without feature selection
+
+```{r}
+control <- trainControl(method = "LGOCV", number = 100, search = "grid", p = 0.7, savePredictions = "final", summaryFunction = twoClassSummary, classProbs = T)
+
+rf.all <- train(subtype~., 
+                data = combined.feature[, -c(1)], 
+                method = "rf", 
+                metric = "ROC", 
+                trControl = control)
+```
+
+RF with selected features
+
+```{r}
+features.select <- feature.summary %>%
+  dplyr::filter(count >= 30)
+
+rf.guided <- train(subtype~., 
+                   data = dplyr::select(combined.feature, c("subtype", features.select$feature)), 
+                   method = "rf", 
+                   metric = "ROC", 
+                   trControl = control)
+```
+
+Compare model performance
+
+```{r, fig.width=5.5, fig.height=5}
+RF_compare <- data.frame(AUC = c(rf.all$resample$ROC, rf.guided$resample$ROC),
+                         classifier = c(rep("RF all features", length(rf.all$resample$ROC)), rep("RF selected features", length(rf.guided$resample$ROC))))
+
+pdf("figures/revision/RF_AUC_compare.pdf", width = 5.5, height = 5)
+ggplot(RF_compare, aes(x=classifier, y=AUC)) + 
+  xlab("")+
+  geom_boxplot() +
+  theme_bw()
+dev.off()
+
+RF_compare.summary <- RF_compare %>%
+  group_by(classifier) %>%
+  summarise(mean_AUC = mean(AUC))
+```
+
+
+
+

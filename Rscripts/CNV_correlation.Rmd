@@ -1,0 +1,267 @@
+---
+title: "PDM SCM CNV analysis"
+output: html_document
+date: "2024-07-31"
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(corrplot)
+library(ggbiplot)
+library(ggpubr)
+library(cowplot)
+library(ggdendro)
+library(RColorBrewer)
+library(RaggedExperiment)
+library(factoextra)
+library(GenomicRanges)
+library(EnsDb.Hsapiens.v75)
+source("Myfunctions.R")
+set.seed(1234)
+```
+
+## Results {.tabset}  
+
+### features associated with subtypes
+
+Annotate segment by genes
+
+```{r, message=FALSE, warning=FALSE}
+# Genes in covered intervals
+interval <- read.table("/vast/ai_projects/melanoma_depigmentation_biomarker_discovery/peinan/PDM_SCM/data/ref/resources/TST500C_manifest.bed", sep = "\t")
+seq.genes <- unique(gsub("_.*","", interval$V4))
+
+# Convert segment table to GRanges
+PDM_seg <- read.table("/vast/ai_projects/melanoma_depigmentation_biomarker_discovery/peinan/PDM_SCM/data/GISTIC/PDM_segments.txt", sep = "\t", header = T) %>%
+  dplyr::filter(Chromosome != "Y")
+SCM_seg <- read.table("/vast/ai_projects/melanoma_depigmentation_biomarker_discovery/peinan/PDM_SCM/data/GISTIC/SCM_segments.txt", sep = "\t", header = T) %>%
+  dplyr::filter(Chromosome != "Y")
+segment_all <- rbind(PDM_seg, SCM_seg)
+segment_grl.list <- makeGRangesListFromDataFrame(segment_all[,-c(5)], split.field="Sample", keep.extra.columns=TRUE)
+segment_grl.list <- GenomicRanges::sort(segment_grl.list)
+
+# Map to Ensembl gene annotation V75 GRCh37 (hg19)
+hs.genes <- ensembldb::genes(EnsDb.Hsapiens.v75)
+sel.genes <- subset(hs.genes, gene_name %in% seq.genes)
+CNV.regions <- as(segment_grl.list, "RaggedExperiment")
+qassay <- GrangetoQassay(CNV.regions, sel.genes, .largest)
+data.CNV <- t(qassay) %>%
+  as.data.frame()
+
+names(data.CNV) <- paste(names(data.CNV), "_log2R", sep = "")
+data.CNV <- data.CNV %>%
+  mutate(Subtype = ifelse(grepl("PDM", rownames(data.CNV)), 0, 1), .before = 1)
+
+# annotate genes by chromosomes
+sel.genes <- sel.genes%>%
+  as.data.frame() #%>%
+  #mutate(gene_name = gsub("\\-", "\\.", gene_name))
+
+gene.annotate <- data.frame(feature = grep("log2R", names(data.CNV), value = T)) %>%
+  mutate(gene_name = gsub("_log2R", "", feature)) %>%
+  left_join(dplyr::select(sel.genes, c("gene_name", "seqnames")), by = "gene_name") %>%
+  dplyr::filter(seqnames %in% c(1:22, "X")) %>%
+  mutate(gene_annotate = paste(gene_name, "_chr", seqnames, sep = "")) 
+
+colnames(data.CNV)[match(gene.annotate$feature, names(data.CNV))] <- gene.annotate$gene_annotate
+```  
+
+
+```{r}
+# H2O.CNV <- data.CNV %>%
+#   mutate(sample = rownames(data.CNV), .before = 1,
+#          Subtype = ifelse(Subtype == 0, "PDM", "metastasis")) %>%
+#   left_join(dplyr::select(PureCN_summary, c("sample","purity", "ploidy","PGA_diploid","PGA_dominant","LOH_fraction")), by = "sample") %>%
+#   left_join(filtered_mutations, by = c("sample" = "Tumor_Sample_Barcode")) %>%
+#   dplyr::select(-sample)
+# write.csv(H2O.CNV, "tables/PDM_all_features_H2O_input.csv", row.names = F)
+```
+
+
+Filter non-altered genes. 
+
+```{r}
+PDM.CNV <- data.CNV %>%
+  dplyr::filter(grepl("PDM", rownames(data.CNV)))
+
+SCM.CNV <- data.CNV %>%
+  dplyr::filter(grepl("SCM", rownames(data.CNV)))
+
+CNV.event.PDM <- PDM.CNV %>%
+  summarise(across(everything(), ~ sum(. < -0.1 | . > 0.1)))
+
+CNV.event.SCM <- SCM.CNV %>%
+  summarise(across(everything(), ~ sum(. < -0.1 | . > 0.1)))
+
+data.CNV <- data.CNV[,which(CNV.event.PDM>2 | CNV.event.SCM>2)]
+```
+
+select features associated with subtypes (Spearman corrolation, R^2 > 0.25)
+
+```{r, message=FALSE, warning=FALSE}
+data.CNV.cor <- cor(data.CNV, method = "spearman") %>%
+  as.data.frame() %>%
+  dplyr::filter(abs(Subtype) > 0.25) 
+
+data.CNV.subset <- data.CNV %>%
+  dplyr::select(rownames(data.CNV.cor)) 
+
+# data.CNV.cor.PDM <- data.CNV.subtype.cor %>%
+#   dplyr::filter(Subtype> 0.25)
+```
+
+correlation dendrogram of associated features
+
+```{r, fig.width=8, fig.height=3, message=FALSE, warning=FALSE}
+# spearman correlation on subset CN data
+data.CNV.subset.cor <- cor(data.CNV.subset, method = "spearman")
+
+# calculate distant matrix
+dist_mat <- dist(data.CNV.subset.cor[-c(1), -c(1)], method = 'euclidean')
+
+# hierarchical clustering 
+hclust_avg <- hclust(dist_mat, method = 'average') %>%
+  as.dendrogram
+
+# dendgrogram data
+dend_data <- label(dendro_data(hclust_avg, type = "rectangle")) %>%
+  mutate(gene = str_split(label,pattern = "_", simplify = T)[,1],
+         chromosome = str_split(label,pattern = "_", simplify = T)[,2])
+
+chrom_seq <- paste("chr", c(1:22, "X"), sep = "")
+chr_col <- colorRampPalette(c("grey20", "#E69F00", "#56B4E9", "tomato", "purple", "navyblue", "#CC79A7",  "#D55E00"))(23)
+
+
+#pdf("figures/CNV_corplot_dendrogram.pdf", width = 8, height = 3)
+ggplot(segment(dendro_data(hclust_avg, type = "rectangle"))) +
+  geom_segment(aes(x=x, y=y, xend=xend, yend=yend)) + 
+  geom_text(data=dend_data, aes(label=label, x=x, y=-0.2, colour=chromosome), hjust = 1, angle = 90, size = 2.5, show.legend = F) +
+  ylim(-4, 7) +
+  scale_color_manual(values = chr_col) +
+  theme_dendro()
+#dev.off()
+```
+
+correlation plot of associated features
+
+```{r, fig.width=8, fig.height=8, message=FALSE, warning=FALSE}
+#pdf("CNV_corplot.pdf", width = 7.5, height = 7.5)
+corrplot(data.CNV.subset.cor[c("Subtype", labels(hclust_avg)), c("Subtype", labels(hclust_avg))], tl.cex = 0.4, col=rev(COL2("PuOr", 200)), method = 'square', tl.col = "black")
+#dev.off()
+```  
+
+PCA using associated features
+
+```{r, fig.width=7.5, fig.height=7, message=FALSE, warning=FALSE}
+cnvsubset.pca <- prcomp(data.CNV.subset[,-c(1)], scale. = T, center = T)
+pca.res <- get_pca_var(cnvsubset.pca)
+
+p1 <- fviz_eig(cnvsubset.pca)
+p2 <- ggbiplot(cnvsubset.pca, var.axes = F, groups = factor(ifelse(data.CNV.subset$Subtype==1, "PDM", "metastasis"), labels = c("PDM", "metastasis")), choices = c(1,2), scale = 0)+
+  scale_color_manual(values=c("#56B4E9", "#E69F00"))
+p3 <- fviz_contrib(cnvsubset.pca, choice = "var", 
+                   top =  sum(pca.res$contrib[,"Dim.1"] > 100/length(pca.res$contrib[,"Dim.1"])), axes = 1) 
+toprow <- plot_grid(p1, p2, labels = c('A', 'B'), label_size = 12)
+
+# pdf("figures/CNV_PCA_correlated_features.pdf", width = 7.5, height = 8)
+plot_grid(toprow, p3, labels = c('', 'C'), label_size = 12, nrow = 2)
+# dev.off()
+```  
+
+
+### cluster all CN features
+
+hierarchical clustering of CN features
+
+```{r, fig.width=15, fig.height=5, message=FALSE, warning=FALSE}
+chrom_seq <- paste("chr", c(1:22, "X"), sep = "")
+chr_col <- colorRampPalette(c("grey20", "#E69F00", "#56B4E9", "tomato", "purple", "navyblue", "#CC79A7",  "#D55E00"))(23)
+
+data.CNV.t <- t(data.CNV[,-c(1)])
+# data.CNV.cor <- cor(data.CNV[, -c(1)], method = "spearman") 
+
+dist_mat <- dist(data.CNV.t, method = 'manhattan')
+hclust_avg <- hclust(dist_mat, method = 'complete')
+plot(hclust_avg)
+```
+
+Group the clustered CN features. Features are grouped by hierarchical clustering (threshold indicated as a red dashed line). Text/dot colours indicate the chromosomal number of the features.
+
+```{r, fig.width=15, fig.height=5, message=FALSE, warning=FALSE}
+dend_data <- label(dendro_data(hclust_avg, type = "rectangle")) %>%
+  mutate(gene = str_split(label,pattern = "_", simplify = T)[,1],
+         chromosome = str_split(label,pattern = "_", simplify = T)[,2], 
+         chromosome = factor(chromosome, levels = chrom_seq)) 
+
+
+#pdf("figures/CNV_dendrogram_all_features_text.pdf", width = 15, height = 5)
+ggdendrogram(hclust_avg, labels = F) +
+  geom_text(data=dend_data, aes(label=label, x=x, y=-0.2, colour=chromosome), hjust = 1, angle = 90, size = 2.5, show.legend = F) +
+  geom_hline(yintercept=5.5, linetype="dashed", color = "red") +
+  scale_colour_manual(values = chr_col) +
+  theme_dendro()
+#dev.off()
+
+#pdf("figures/CNV_dendrogram_all_features_dot.pdf", width = 15, height = 5)
+ggdendrogram(hclust_avg, labels = F) +
+  geom_point(data=dend_data, aes(x=x, y=-0.2, colour=chromosome), size = 2, show.legend = T) +
+  geom_hline(yintercept=5.5, linetype="dashed", color = "red") +
+  scale_colour_manual(values = chr_col) +
+  theme_dendro()
+#dev.off()
+```  
+
+check the number of clusters, and number of unique chromosomes in each cluster
+
+```{r, message=FALSE, warning=FALSE}
+cut_tree <- cutree(hclust_avg, h = 5.5)
+hclust.cluster = data.frame(feature = names(cut_tree), cluster = as.numeric(cut_tree))%>%
+  mutate(gene = str_split(feature,pattern = "_", simplify = T)[,1],
+         chromosome = str_split(feature,pattern = "_", simplify = T)[,2]) 
+
+hclust.cluster.summary <- hclust.cluster %>%
+  group_by(cluster) %>%
+  summarise(unique_chr = n_distinct(chromosome),
+            gene_number = n(), 
+            chr = unique(chromosome)) %>%
+  mutate(cluster = paste("cluster_", cluster, sep = "")) 
+
+cat("Total cluster number: ", length(unique(hclust.cluster$cluster)), "\n")
+cat("Max number of chromosome in each cluster: ", max(hclust.cluster.summary$unique_chr))
+``` 
+
+calculate average copy ratio of each cluster
+
+```{r, message=FALSE, warning=FALSE}
+data.CNV.t <- t(data.CNV[,-c(1)]) %>%
+  as.data.frame() %>%
+  mutate(feature = names(data.CNV[,-c(1)])) %>%
+  left_join(hclust.cluster, by = "feature")
+
+data.CNV.cluster <- data.CNV.t %>%
+  group_by(cluster) %>%
+  summarise_at(.vars = rownames(data.CNV), .funs = mean)
+
+data.CNV.cluster.t <- t(data.CNV.cluster[,-c(1)]) %>%
+  as.data.frame()
+names(data.CNV.cluster.t) <- paste("cluster_", data.CNV.cluster$cluster, sep = "")
+```  
+
+write CN clusters
+
+```{r}
+data.CNV.cluster.t <- data.CNV.cluster.t %>%
+  mutate(sample = rownames(data.CNV.cluster.t), .before = cluster_1)
+#write.csv(data.CNV.cluster.t, file = "tables/CNV_clusters_avg_log2R.csv", row.names = F)
+```
+
+
+
+
+
+
+
+
+
+
+
